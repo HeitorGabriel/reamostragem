@@ -1,0 +1,338 @@
+---
+title: "Métodos de Reamostragem:"
+subtitle: "k-Fold-CV, Monte Carlo, LOO-CV e Bootstrap no Tidymodels"
+author: "Heitor Gabriel S. Monteiro"
+date: "15/11/2021"
+geometry: margin=1in
+fontfamily: mathpazo
+fontsize: 12pt
+output:
+  html_document:
+    highlight: tango
+    theme: cerulean
+    number_sections: yes
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+  pdf_document:
+    toc: true
+    number_sections: true
+    highlight: tango
+always_allow_html: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Prelúdio
+
+Nosso objetivo é exercitar os algoritmos de reamostragem, que servem para validação dos modelos, visto que a amostragem usada como treino e teste podem influenciar as estimativas dos parâmetros. PAra fins de replicação, fixarei a aleatoriedade em *123*.
+
+```{r, warning=FALSE, message=FALSE}
+setwd('/home/heitor/Área de Trabalho/R Projects/Análise Macro/Labs/Lab 13')
+
+library(tidyverse)
+library(tidymodels)
+library(tensorflow)
+library(plotly)
+library(GGally) # para os gráficos de correlação
+library(ISLR)   # para a base de dados usada
+
+set.seed(123)
+```
+
+Os dados são até bem organizados, as únicas alterações que fiz foi na variável-fator de `origin`, do modelo de carros:
+
+```{r, warning=FALSE, message=FALSE}
+dds <- as.data.frame(Auto) %>% 
+	mutate(made_in = 
+		   	case_when(Auto$origin==1 ~ 'america',
+		   			  Auto$origin==2 ~ 'europe',
+		   			  Auto$origin==3 ~ 'japan')) %>%
+	mutate(made_in = as.factor(made_in)) %>% 
+	select(-origin) %>% 
+	as_tibble()
+
+dds %>% str()
+```
+
+# Estatísticas Descritivas
+
+A seguir, algumas estatísticas descritivas sobre os dados usados.
+
+```{r}
+dds %>% summary()
+```
+
+
+```{r, warning=FALSE, message=FALSE, fig.align='center', fig.width=9, fig.height=4}
+ggcorr(dds %>%
+	   	select(!c('year', 'name', 'made_in')),
+	   label = T)
+```
+
+
+```{r, warning=FALSE, message=FALSE, fig.align='center', fig.width=9, fig.height=7}
+ggpairs(dds %>%
+			select(!c('year', 'name')),
+	columns = 1:6,
+	ggplot2::aes(colour=made_in, alpha=.3)) #%>% ggplotly()
+```
+
+Como exercício, usaremos `horsepower` para explicar `mpg`:
+
+```{r, warning=FALSE, message=FALSE, fig.align='center', fig.width=9, fig.height=4}
+ggplot(
+	dds, aes(x=horsepower, y=mpg))+
+	geom_point(aes(color=made_in), alpha=.66)+
+	geom_smooth(method = 'auto',
+				colour='red',
+				size = .8,
+				se=FALSE) #%>% ggplotly()
+```
+
+# Divisão: Treino & Teste
+
+A primeira divisão é feita abaixo.
+
+```{r}
+slice_1 <-
+	initial_split(dds %>%
+				  	select(!c('name', 'year',
+				  			  'made_in')))
+train_dds   <- training(slice_1)
+test_dds    <- testing(slice_1)
+```
+
+Digo primeira pois o próprio conjunto de treino é dividido em treino e teste novamente, chamados de *Conjunto de Análise* (para treinar o modelo) e *Conjunto de Avaliação* (para fazer comparar as estimações) para não confundir com a primeira divisão, de acordo com a figura, de [Kuhn e Johnson (2019)](https://bookdown.org/max/FES/resampling.html):
+
+<center>
+
+![Representative Scheme of Resample Method. \label{schm}](resampling.png){width="66%"}
+
+</center>
+
+A reamostragem é feita apenas na amostra de treino. Se fazemos `k` reamostragens, então 1) `k` grupos amostrais são coletados do conjunto treino, formando `k`'s conjuntos de análise; 2) `k` modelos são formados e aplicados nos conjuntos de avaliação; 3) `k` estatísticas de desempenho são criadas. A estatística final de avaliação do modelo é a média das `k` informações de desempenho.
+
+# Modelo
+
+Façamos agora o modelo, que funciona como um esqueleto onde colocaremos as variáveis predita e preditora. Observe que deixamos o `penalty` em aberto, usando um `tune()` no lugar. Esse parâmetro será ajustado conforme o menor erro quadrático médio (definiremos mais adiante), o processo de reamostragem nos dirá qual é a melhor regularização a ser usada. No caso do pacote *keras*, `penalty` é a penalização de um *ridge regression*, portanto, um parâmetro de regularização de Tikhonov.
+
+```{r}
+glm_algorit <- linear_reg( penalty = tune()) %>% 
+						  # mixture = 1) %>% 
+	set_mode('regression') %>% 
+	set_engine("keras")
+
+glm_algorit %>% translate()
+```
+
+# Fórmula
+
+Agora, dizemos quais e como as variáveis `x` e `y` alimentarão esse modelo. No caso, o grau do polinômio está em aberto e será *tunado* mais a diante. Por esse motivo, não finalizamos a cadeia da "receita" com ` %>% prep()` nem veremos como ficam os termos usados aplicados aos dados com o `bake()`, como de costume.
+
+```{r}
+recipe_glm <- recipe(mpg ~ horsepower,
+					 data=train_dds) %>%
+	step_poly( horsepower,
+			   role = "predictor",
+			   trained = FALSE,
+			   objects = NULL,
+			   degree = tune())
+```
+
+
+# Workflow
+
+Definiremos um `workflow()`, alimentando o modelo com as variáveis:
+
+```{r}
+glm_wrkflw <- workflow() %>%
+	add_model(glm_algorit) %>%
+	add_recipe(recipe_glm)
+```
+
+
+# Validações
+
+Definiremos agora três processos de reamostragens. Um ótimo material para aprendê-las, além dos listados nas referências, é o [Kuhn & Johnson (2019)](https://bookdown.org/max/FES/resampling.html).
+
+## Reamostragem Cruzada k-Fold
+
+```{r}
+vc_kfold <- vfold_cv(train_dds,
+					 v=10,
+					 repeats = 2)
+```
+
+## Reamostragem Bootstrap
+
+```{r}
+v_boot <- bootstraps(train_dds,
+					 times = 5)
+```
+
+
+## Reamostragem Monte-Carlo
+
+```{r}
+vc_mc <- mc_cv(train_dds,
+			   prop = 4/5,
+			   times=3)
+```
+
+# Ajustes e Treinamentos
+
+Definiremos quais intervalos os dois parâmetros ajustáveis serão testados com `update()` e, para cada conjunto de parâmetros, uma quantidade de três valores com `grid_regular()`. 
+
+```{r, warning=FALSE, message=FALSE}
+grid_stand <-
+	glm_wrkflw %>% 
+	parameters() %>% 
+	update(
+		penalty = penalty(range = c(-1, 2),
+				trans = scales::pseudo_log_trans()),
+		degree = degree(range = c(1, 3))
+	) %>% 
+	grid_regular(levels = 3)
+```
+
+Agora a parte que exigirá mais esforço computacional: aplicar os modelos do workflow criado em cada método de reamostragem. Definimos duas mátricas de performace: `rmse`` e `mae`. A principal diferença entre eles é que o erro quadrático médio (`rmse`) põe mais peso nos outliers, é mais sensível a tais observações justamente por elevar a diferença ao quadrado.
+
+```{r, warning=FALSE, message=FALSE, results='hide'}
+glm_train_kfold <- glm_wrkflw %>% 
+	tune_grid(resamples = vc_kfold,
+			  grid      = grid_stand,
+			  control   = control_grid(save_pred = T),
+			  metrics   = metric_set(rmse, mae))
+
+glm_train_boot <- glm_wrkflw %>% 
+	tune_grid(resamples = v_boot,
+			  grid      = grid_stand,
+			  control   = control_grid(save_pred = T),
+			  metrics   = metric_set(rmse, mae))
+
+glm_train_mc <- glm_wrkflw %>% 
+	tune_grid(resamples = vc_mc,
+			  grid      = grid_stand,
+			  control   = control_grid(save_pred = T),
+			  metrics   = metric_set(rmse, mae))
+```
+
+# Seleção do Melhor Modelo
+
+Vejamos os objetos criados para os três métodos de reamostragem. Vemos que não é um dataset convencional, cada item desse objeto é um conjunto de outras informações que podem ser expandidas com  `tidy()`, `augment()` e `unnest()`, caso queira.
+
+```{r, warning=FALSE, message=FALSE}
+glm_train_kfold
+glm_train_boot
+glm_train_mc
+
+collect_metrics(glm_train_kfold)
+collect_metrics(glm_train_boot)
+collect_metrics(glm_train_mc)
+```
+
+Podemos visualizar os resultados nos plots a seguir.
+
+```{r, fig.align='center', fig.width=9, fig.height=4}
+ggplot2::autoplot(glm_train_kfold) +
+	labs(title = 'Parâmetros Ajustáveis Testados no k-Fold ') # %>% ggplotly()
+ggplot2::autoplot(glm_train_boot) +
+	labs(title = 'Parâmetros Ajustáveis Testados no Bootstrap')  # %>% ggplotly()
+ggplot2::autoplot(glm_train_mc) +
+	labs(title = 'Parâmetros Ajustáveis Testados no Monte Carlo')    # %>% ggplotly()
+```
+
+Agora, veremos e coletaremos os melhores conjuntos de parâmetros testados.
+
+```{r, warning=FALSE, message=FALSE}
+glm_train_kfold %>% show_best(n=1)
+glm_train_boot  %>% show_best(n=1)
+glm_train_mc  %>% show_best(n=1)
+
+
+best_tune_1  <- select_best(glm_train_kfold, 'rmse')
+best_tune_2  <- select_best(glm_train_mc, 'rmse')
+```
+
+# Aplicação do Melhor Modelo ao Conjunto de Teste
+
+Como o melhor `penalty` é o mesmo em ambos os best's que escolhemos, farei somente um `finalize_model()` mas dois `finalize_recipe()` para o caso curioso que encontramos de dois `degree`.
+
+```{r, warning=FALSE, message=FALSE}
+final_algotim <- glm_algorit %>%
+	finalize_model(parameters = best_tune_1 %>%
+				   	dplyr::select(`penalty`))
+final_recip_1 <- recipe_glm %>% 
+	finalize_recipe(parameters = best_tune_1 %>%
+						dplyr::select(`degree`))
+final_recip_2 <- recipe_glm %>% 
+	finalize_recipe(parameters = best_tune_2 %>%
+						dplyr::select(`degree`))
+
+glm_final_wrkflw_1 <- workflow() %>% 
+	add_model(final_algotim) %>% 
+	add_recipe(final_recip_1) %>% 
+	last_fit(slice_1) 
+
+glm_final_wrkflw_2 <- workflow() %>% 
+	add_model(final_algotim) %>% 
+	add_recipe(final_recip_2) %>% 
+	last_fit(slice_1) 
+
+glm_final_wrkflw_1$.metrics
+glm_final_wrkflw_1$.predictions
+glm_final_wrkflw_2$.metrics
+glm_final_wrkflw_2$.predictions
+```
+
+Vamos ficar somente com os estimados e os valores verdadeiros para vê-los plotados:
+
+```{r}
+glm_final_wrkflw_1 <- glm_final_wrkflw_1 %>%
+	collect_predictions()
+
+glm_final_wrkflw_2 <- glm_final_wrkflw_2 %>%
+	collect_predictions()
+```
+
+
+```{r, fig.align='center', fig.width=9, fig.height=4}
+glm_final_wrkflw_1 %>% 
+	select(.row, .pred, mpg) %>% 
+	ggplot() +
+	aes(x = mpg,
+		y = .pred) +
+	geom_point() +
+	geom_abline(intercept = 0,
+				slope     = 1,
+				color     ='red',
+				size      = .8) #%>% ggplotly()
+
+glm_final_wrkflw_2 %>% 
+	select(.row, .pred, mpg) %>% 
+	ggplot() +
+	aes(x = mpg,
+		y = .pred) +
+	geom_point() +
+	geom_abline(intercept = 0,
+				slope     = 1,
+				color     ='lightseagreen',
+				size      = .8) #%>%	ggplotly()
+```
+
+
+# Referências
+   - [Resampling for evaluating performance](https://www.tmwr.org/resampling.html)
+   - [Samuel Macêdo - Intro ao Tidymodels](https://youtube.com/playlist?list=PLCQ7-I8jjAsnNnMhvmmPKv4L_e1FLNPak)
+   - [Resampling Methods - ISLR tidymodels Labs](https://emilhvitfeldt.github.io/ISLR-tidymodels-labs/resampling-methods.html)
+   - [Evaluate your model with resampling](https://www.tidymodels.org/start/resampling/)
+   - [Bootstrap resampling and tidy regression models](https://www.tidymodels.org/learn/statistics/bootstrap/)
+   - [V-Fold Cross-Validation](https://rsample.tidymodels.org/reference/vfold_cv.html)
+   - [Leave-One-Out Cross-Validation](https://rsample.tidymodels.org/reference/loo_cv.html)
+   - [Bootstrap Sampling](https://rsample.tidymodels.org/reference/bootstraps.html)
+   - [Andrew MacDonald - bootstrapping regressions with dplyr](https://rstudio-pubs-static.s3.amazonaws.com/19698_a4c472606e3c43e4b94720506e49bb7b.html)
+
